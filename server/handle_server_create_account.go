@@ -17,6 +17,7 @@ import (
 	"github.com/bluesky-social/indigo/util"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
+	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -219,40 +220,33 @@ func (s *Server) handleCreateAccount(e echo.Context) error {
 		}
 	}
 
-	if request.Did == nil || *request.Did == "" {
-		bs := s.getBlockstore(signupDid)
+	// Every new account needs a genesis repo commit — whether cocoon minted
+	// signupDid itself or an existing DID was passed in (the self-custodied
+	// rotation key flow: mint your own did:plc, then pass it here with a
+	// service-auth JWT). This used to be gated behind `request.Did == nil`,
+	// so existing-DID accounts got a Repo/Actor row but no commit: rev/root
+	// stayed empty forever, any write (e.g. creating a post) failed, and the
+	// account was never announced via #identity/#sync (only #account, from
+	// activateAccount) — see recommit.go's own defensive
+	// `if len(urepo.Repo.Root) > 0` before emitting #sync there, which was
+	// silently no-op'ing for exactly this reason.
+	root, rev, err := s.initializeGenesisRepo(context.TODO(), urepo.Did, urepo.SigningKey)
+	if err != nil {
+		logger.Error("error initializing genesis repo", "error", err)
+		return helpers.ServerError(e, nil)
+	}
 
-		clk := syntax.NewTIDClock(0)
-		r := &atp.Repo{
-			DID:         syntax.DID(signupDid),
-			Clock:       clk,
-			MST:         mst.NewEmptyTree(),
-			RecordStore: bs,
-		}
+	s.evtman.AddEvent(context.TODO(), &events.XRPCStreamEvent{
+		RepoIdentity: &atproto.SyncSubscribeRepos_Identity{
+			Did:    urepo.Did,
+			Handle: to.StringPtr(request.Handle),
+			Seq:    time.Now().UnixMicro(), // TODO: no
+			Time:   time.Now().Format(util.ISO8601),
+		},
+	})
 
-		root, rev, err := commitRepo(context.TODO(), bs, r, urepo.SigningKey)
-		if err != nil {
-			logger.Error("error committing", "error", err)
-			return helpers.ServerError(e, nil)
-		}
-
-		if err := s.UpdateRepo(context.TODO(), urepo.Did, root, rev); err != nil {
-			logger.Error("error updating repo after commit", "error", err)
-			return helpers.ServerError(e, nil)
-		}
-
-		s.evtman.AddEvent(context.TODO(), &events.XRPCStreamEvent{
-			RepoIdentity: &atproto.SyncSubscribeRepos_Identity{
-				Did:    urepo.Did,
-				Handle: to.StringPtr(request.Handle),
-				Seq:    time.Now().UnixMicro(), // TODO: no
-				Time:   time.Now().Format(util.ISO8601),
-			},
-		})
-
-		if err := s.emitRepoSync(context.TODO(), urepo.Did, rev, root); err != nil {
-			logger.Error("error emitting repo sync event", "error", err)
-		}
+	if err := s.emitRepoSync(context.TODO(), urepo.Did, rev, root); err != nil {
+		logger.Error("error emitting repo sync event", "error", err)
 	}
 
 	sess, err := s.createSession(ctx, &urepo)
@@ -276,4 +270,31 @@ func (s *Server) handleCreateAccount(e echo.Context) error {
 		Handle:     request.Handle,
 		Did:        signupDid,
 	})
+}
+
+// initializeGenesisRepo commits an empty MST for did and records it as the
+// repo's current head. Mirrors seedGenesisRepo in firehose_sync_test.go;
+// every new account needs this, whether cocoon minted did itself or an
+// existing DID was passed in to createAccount.
+func (s *Server) initializeGenesisRepo(ctx context.Context, did string, signingKey []byte) (cid.Cid, string, error) {
+	bs := s.getBlockstore(did)
+
+	clk := syntax.NewTIDClock(0)
+	r := &atp.Repo{
+		DID:         syntax.DID(did),
+		Clock:       clk,
+		MST:         mst.NewEmptyTree(),
+		RecordStore: bs,
+	}
+
+	root, rev, err := commitRepo(ctx, bs, r, signingKey)
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("commit genesis repo: %w", err)
+	}
+
+	if err := s.UpdateRepo(ctx, did, root, rev); err != nil {
+		return cid.Undef, "", fmt.Errorf("update repo after genesis commit: %w", err)
+	}
+
+	return root, rev, nil
 }
