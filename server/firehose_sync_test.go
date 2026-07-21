@@ -8,9 +8,6 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/api/atproto"
-	atp "github.com/bluesky-social/indigo/atproto/repo"
-	"github.com/bluesky-social/indigo/atproto/repo/mst"
-	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/ipfs/go-cid"
 	"gorm.io/driver/sqlite"
@@ -34,22 +31,13 @@ func newTestEvtman(t *testing.T) *events.EventManager {
 }
 
 // seedGenesisRepo commits an empty repo for did and records it as the head.
+// Thin wrapper around the production initializeGenesisRepo, so tests exercise
+// the same code path createAccount does.
 func (s *Server) seedGenesisRepo(t *testing.T, did string, signingKey []byte) (cid.Cid, string) {
 	t.Helper()
-	bs := s.getBlockstore(did)
-	clk := syntax.NewTIDClock(0)
-	r := &atp.Repo{
-		DID:         syntax.DID(did),
-		Clock:       clk,
-		MST:         mst.NewEmptyTree(),
-		RecordStore: bs,
-	}
-	root, rev, err := commitRepo(context.Background(), bs, r, signingKey)
+	root, rev, err := s.initializeGenesisRepo(context.Background(), did, signingKey)
 	if err != nil {
-		t.Fatalf("commit genesis: %v", err)
-	}
-	if err := s.UpdateRepo(context.Background(), did, root, rev); err != nil {
-		t.Fatalf("update repo: %v", err)
+		t.Fatalf("seed genesis repo: %v", err)
 	}
 	return root, rev
 }
