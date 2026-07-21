@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -88,54 +90,7 @@ func (s *Server) handleSyncSubscribeRepos(e echo.Context) error {
 		}
 	}()
 
-	header := events.EventHeader{Op: events.EvtKindMessage}
-	for evt := range evts {
-		func() {
-			defer func() {
-				metrics.RelaySends.WithLabelValues(ident, header.MsgType).Inc()
-			}()
-
-			wc, err := conn.NextWriter(websocket.BinaryMessage)
-			if err != nil {
-				logger.Error("error writing message to relay", "err", err)
-				return
-			}
-
-			if ctx.Err() != nil {
-				logger.Error("context error", "err", err)
-				return
-			}
-
-			var obj util.CBOR
-			if evt.Error != nil {
-				header.Op = events.EvtKindErrorFrame
-				header.MsgType = ""
-				obj = evt.Error
-			} else if msgType, o, ok := subscribeReposMsgType(evt); ok {
-				header.Op = events.EvtKindMessage
-				header.MsgType = msgType
-				obj = o
-			} else {
-				logger.Warn("unrecognized event kind")
-				return
-			}
-
-			if err := header.MarshalCBOR(wc); err != nil {
-				logger.Error("failed to write header to relay", "err", err)
-				return
-			}
-
-			if err := obj.MarshalCBOR(wc); err != nil {
-				logger.Error("failed to write event to relay", "err", err)
-				return
-			}
-
-			if err := wc.Close(); err != nil {
-				logger.Error("failed to flush-close our event write", "err", err)
-				return
-			}
-		}()
-	}
+	s.sendReposEvents(ctx, conn, evts, ident, logger)
 
 	// we should tell the relay to request a new crawl at this point if we got disconnected
 	// use a new context since the old one might be cancelled at this point
@@ -148,4 +103,83 @@ func (s *Server) handleSyncSubscribeRepos(e echo.Context) error {
 	}()
 
 	return nil
+}
+
+// wsMessageWriter is the slice of *websocket.Conn that sendReposEvents needs.
+// Narrowed to an interface so the event-forwarding loop is testable without a
+// real websocket handshake.
+type wsMessageWriter interface {
+	NextWriter(messageType int) (io.WriteCloser, error)
+}
+
+// sendReposEvents forwards events from evts to conn until ctx is cancelled or
+// evts is closed, then returns.
+//
+// This used to be `for evt := range evts { ...; if ctx.Err() != nil { return } }`,
+// where that `return` only exited the per-event closure, not the loop — so
+// once a connection's context was cancelled (which happens on every ordinary
+// websocket read error, i.e. routinely on any long-lived relay connection),
+// this would never actually return. It would sit blocked on the next receive
+// from evts, and once a new event eventually arrived, log "context error"
+// and go right back to waiting for another one, forever. The deferred
+// evtManCancel() above (and the relay-metrics decrement, and the requestCrawl
+// retry after this call) never ran, leaking a goroutine and an
+// events.EventManager subscription per disconnect for the life of the
+// process. Selecting on ctx.Done() alongside evts fixes that: cancellation
+// is noticed immediately, whether or not another event ever arrives.
+func (s *Server) sendReposEvents(ctx context.Context, conn wsMessageWriter, evts <-chan *events.XRPCStreamEvent, ident string, logger *slog.Logger) {
+	header := events.EventHeader{Op: events.EvtKindMessage}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-evts:
+			if !ok {
+				return
+			}
+			s.sendReposEvent(conn, ident, &header, evt, logger)
+		}
+	}
+}
+
+// sendReposEvent serializes and writes a single event frame to conn.
+func (s *Server) sendReposEvent(conn wsMessageWriter, ident string, header *events.EventHeader, evt *events.XRPCStreamEvent, logger *slog.Logger) {
+	defer func() {
+		metrics.RelaySends.WithLabelValues(ident, header.MsgType).Inc()
+	}()
+
+	wc, err := conn.NextWriter(websocket.BinaryMessage)
+	if err != nil {
+		logger.Error("error writing message to relay", "err", err)
+		return
+	}
+
+	var obj util.CBOR
+	if evt.Error != nil {
+		header.Op = events.EvtKindErrorFrame
+		header.MsgType = ""
+		obj = evt.Error
+	} else if msgType, o, ok := subscribeReposMsgType(evt); ok {
+		header.Op = events.EvtKindMessage
+		header.MsgType = msgType
+		obj = o
+	} else {
+		logger.Warn("unrecognized event kind")
+		return
+	}
+
+	if err := header.MarshalCBOR(wc); err != nil {
+		logger.Error("failed to write header to relay", "err", err)
+		return
+	}
+
+	if err := obj.MarshalCBOR(wc); err != nil {
+		logger.Error("failed to write event to relay", "err", err)
+		return
+	}
+
+	if err := wc.Close(); err != nil {
+		logger.Error("failed to flush-close our event write", "err", err)
+		return
+	}
 }
