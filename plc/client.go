@@ -166,6 +166,36 @@ func (c *Client) SendOperation(ctx context.Context, did string, op *Operation) e
 	return nil
 }
 
+// GetAuditLog fetches a DID's full operation history. Uses this client's own
+// configured service URL and http.Client (both overridable via ClientArgs),
+// unlike identity.FetchDidAuditLog, which always hits the real
+// https://plc.directory - keeping this on the client makes it possible to
+// point at a local test server instead.
+func (c *Client) GetAuditLog(ctx context.Context, did string) (identity.DidAuditLog, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.service+"/"+url.QueryEscape(did)+"/log/audit", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.h.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("could not find identity in plc registry")
+	}
+
+	var log identity.DidAuditLog
+	if err := json.NewDecoder(resp.Body).Decode(&log); err != nil {
+		return nil, err
+	}
+
+	return log, nil
+}
+
 func DidFromOp(op *Operation) (string, error) {
 	b, err := op.MarshalCBOR()
 	if err != nil {

@@ -10,7 +10,6 @@ import (
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/util"
-	"github.com/haileyok/cocoon/identity"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/models"
 	"github.com/haileyok/cocoon/plc"
@@ -41,7 +40,7 @@ func (s *Server) handleIdentityUpdateHandle(e echo.Context) error {
 	ctx := context.WithValue(e.Request().Context(), "skip-cache", true)
 
 	if strings.HasPrefix(repo.Repo.Did, "did:plc:") {
-		log, err := identity.FetchDidAuditLog(ctx, nil, repo.Repo.Did)
+		log, err := s.plcClient.GetAuditLog(ctx, repo.Repo.Did)
 		if err != nil {
 			logger.Error("error fetching doc", "error", err)
 			return helpers.ServerError(e, nil)
