@@ -49,37 +49,52 @@ func (s *Server) handleIdentityUpdateHandle(e echo.Context) error {
 
 		latest := log[len(log)-1]
 
-		var newAka []string
+		alreadyPublished := false
 		for _, aka := range latest.Operation.AlsoKnownAs {
-			if aka == "at://"+repo.Handle {
-				continue
+			if aka == "at://"+req.Handle {
+				alreadyPublished = true
+				break
 			}
-			newAka = append(newAka, aka)
 		}
 
-		newAka = append(newAka, "at://"+req.Handle)
+		// If the DID document already shows this handle - e.g. a
+		// self-custodied account whose owner published the change
+		// directly, holding their own rotation key rather than this
+		// PDS's - there's nothing left to submit. Skip straight to
+		// syncing local state below.
+		if !alreadyPublished {
+			var newAka []string
+			for _, aka := range latest.Operation.AlsoKnownAs {
+				if aka == "at://"+repo.Handle {
+					continue
+				}
+				newAka = append(newAka, aka)
+			}
 
-		op := plc.Operation{
-			Type:                "plc_operation",
-			VerificationMethods: latest.Operation.VerificationMethods,
-			RotationKeys:        latest.Operation.RotationKeys,
-			AlsoKnownAs:         newAka,
-			Services:            latest.Operation.Services,
-			Prev:                &latest.Cid,
-		}
+			newAka = append(newAka, "at://"+req.Handle)
 
-		k, err := atcrypto.ParsePrivateBytesK256(repo.SigningKey)
-		if err != nil {
-			logger.Error("error parsing signing key", "error", err)
-			return helpers.ServerError(e, nil)
-		}
+			op := plc.Operation{
+				Type:                "plc_operation",
+				VerificationMethods: latest.Operation.VerificationMethods,
+				RotationKeys:        latest.Operation.RotationKeys,
+				AlsoKnownAs:         newAka,
+				Services:            latest.Operation.Services,
+				Prev:                &latest.Cid,
+			}
 
-		if err := s.plcClient.SignOp(k, &op); err != nil {
-			return err
-		}
+			k, err := atcrypto.ParsePrivateBytesK256(repo.SigningKey)
+			if err != nil {
+				logger.Error("error parsing signing key", "error", err)
+				return helpers.ServerError(e, nil)
+			}
 
-		if err := s.plcClient.SendOperation(e.Request().Context(), repo.Repo.Did, &op); err != nil {
-			return err
+			if err := s.plcClient.SignOp(k, &op); err != nil {
+				return err
+			}
+
+			if err := s.plcClient.SendOperation(e.Request().Context(), repo.Repo.Did, &op); err != nil {
+				return err
+			}
 		}
 	}
 
